@@ -1,8 +1,9 @@
 #!/bin/bash
 # Claude Code Statusline Setup Script
 #
-# Shows: model name, project folder, git branch/status, session cost,
-#        context usage bar, 5-hour and 7-day rate limit bars (Pro/Max subscribers)
+# Shows: model name + effort, project folder, git branch/status (worktree-aware),
+#        session name, vim mode, context usage bar, 5h/7d rate-limit bars with
+#        reset countdowns (Pro/Max subscribers).
 #
 # Usage:
 #   bash setup-statusline.sh
@@ -65,16 +66,51 @@ cat > ~/.claude/statusline.sh << 'SCRIPT'
 input=$(cat)
 MODEL=$(echo "$input" | jq -r '.model.display_name')
 DIR=$(echo "$input" | jq -r '.workspace.current_dir')
-CTX=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
-Q5H=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' 2>/dev/null | cut -d. -f1)
-Q7D=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' 2>/dev/null | cut -d. -f1)
-COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
+SESSION_NAME=$(echo "$input" | jq -r '.session_name // empty')
+VIM_MODE=$(echo "$input" | jq -r '.vim.mode // empty')
+WORKTREE_BRANCH=$(echo "$input" | jq -r '.worktree.branch // empty')
+EFFORT=$(echo "$input" | jq -r '.effort.level // empty')
 
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-CYAN='\033[36m'
-RESET='\033[0m'
+# Context: null before first API call, so default to 0
+CTX_RAW=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
+CTX=$(printf '%.0f' "$CTX_RAW" 2>/dev/null || echo 0)
+
+Q5H=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' 2>/dev/null)
+[ -n "$Q5H" ] && Q5H=$(printf '%.0f' "$Q5H")
+Q5H_RESET=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty' 2>/dev/null)
+Q7D=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' 2>/dev/null)
+[ -n "$Q7D" ] && Q7D=$(printf '%.0f' "$Q7D")
+Q7D_RESET=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty' 2>/dev/null)
+
+# ANSI-C quoting ($'...') so each variable holds a real ESC byte — required for
+# correct rendering when the codes are interpolated into %s arguments later.
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+CYAN=$'\033[36m'
+MAGENTA=$'\033[35m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+# Convert a future Unix epoch timestamp to a compact "Xh Ym" / "Xd Yh" string.
+reset_eta() {
+  local epoch=$1
+  [ -z "$epoch" ] && return
+  local now
+  now=$(date +%s 2>/dev/null) || return
+  local diff=$(( epoch - now ))
+  [ "$diff" -le 0 ] && return
+  local days=$(( diff / 86400 ))
+  local hours=$(( (diff % 86400) / 3600 ))
+  local mins=$(( (diff % 3600) / 60 ))
+  if [ "$days" -gt 0 ]; then
+    echo "${days}d ${hours}h"
+  elif [ "$hours" -gt 0 ]; then
+    echo "${hours}h ${mins}m"
+  else
+    echo "${mins}m"
+  fi
+}
 
 # Build a 10-segment bar from a percentage
 make_bar() {
@@ -100,35 +136,79 @@ pick_color() {
 CTX_COLOR=$(pick_color "$CTX")
 CTX_BAR=$(make_bar "$CTX")
 
-# Rate limit bars
+# Rate limit bars + reset countdowns
 LIMITS=""
 if [ -n "$Q5H" ]; then
   Q5H_COLOR=$(pick_color "$Q5H")
   Q5H_BAR=$(make_bar "$Q5H")
-  LIMITS=" | 5h:${Q5H_COLOR}[${Q5H_BAR}]${RESET}${Q5H}%"
+  Q5H_ETA=$(reset_eta "$Q5H_RESET")
+  Q5H_ETA_STR=""
+  [ -n "$Q5H_ETA" ] && Q5H_ETA_STR=" rst:${Q5H_ETA}"
+  LIMITS=" | 5h:${Q5H_COLOR}[${Q5H_BAR}]${RESET}${Q5H}%${Q5H_ETA_STR}"
 fi
 if [ -n "$Q7D" ]; then
   Q7D_COLOR=$(pick_color "$Q7D")
   Q7D_BAR=$(make_bar "$Q7D")
-  LIMITS="${LIMITS} 7d:${Q7D_COLOR}[${Q7D_BAR}]${RESET}${Q7D}%"
+  Q7D_ETA=$(reset_eta "$Q7D_RESET")
+  Q7D_ETA_STR=""
+  [ -n "$Q7D_ETA" ] && Q7D_ETA_STR=" rst:${Q7D_ETA}"
+  LIMITS="${LIMITS} 7d:${Q7D_COLOR}[${Q7D_BAR}]${RESET}${Q7D}%${Q7D_ETA_STR}"
 fi
 
-# Git info
+# Git info — prefer worktree branch from JSON, then live git query
 GIT_INFO=""
-if git -C "$DIR" rev-parse --git-dir > /dev/null 2>&1; then
-  BRANCH=$(git -C "$DIR" branch --show-current 2>/dev/null)
-  STAGED=$(git -C "$DIR" diff --cached --numstat 2>/dev/null | wc -l | tr -d ' ')
-  MODIFIED=$(git -C "$DIR" diff --numstat 2>/dev/null | wc -l | tr -d ' ')
-  GIT_STATUS=""
-  [ "$STAGED" -gt 0 ] && GIT_STATUS="${GREEN}+${STAGED}${RESET}"
-  [ "$MODIFIED" -gt 0 ] && GIT_STATUS="${GIT_STATUS}${YELLOW}~${MODIFIED}${RESET}"
-  GIT_INFO=" | ${BRANCH}${GIT_STATUS:+ $GIT_STATUS}"
+GIT_DIR="$DIR"
+if [ -n "$WORKTREE_BRANCH" ]; then
+  GIT_INFO=" | ${WORKTREE_BRANCH}"
+  if git -C "$GIT_DIR" rev-parse --git-dir > /dev/null 2>&1; then
+    STAGED=$(git -C "$GIT_DIR" diff --cached --numstat --no-lock-index 2>/dev/null | wc -l | tr -d ' ')
+    MODIFIED=$(git -C "$GIT_DIR" diff --numstat --no-lock-index 2>/dev/null | wc -l | tr -d ' ')
+    GIT_ST=""
+    [ "$STAGED" -gt 0 ] && GIT_ST="${GREEN}+${STAGED}${RESET}"
+    [ "$MODIFIED" -gt 0 ] && GIT_ST="${GIT_ST}${YELLOW}~${MODIFIED}${RESET}"
+    [ -n "$GIT_ST" ] && GIT_INFO="${GIT_INFO} ${GIT_ST}"
+  fi
+elif git -C "$GIT_DIR" rev-parse --git-dir > /dev/null 2>&1; then
+  BRANCH=$(git -C "$GIT_DIR" branch --show-current --no-lock-index 2>/dev/null)
+  STAGED=$(git -C "$GIT_DIR" diff --cached --numstat --no-lock-index 2>/dev/null | wc -l | tr -d ' ')
+  MODIFIED=$(git -C "$GIT_DIR" diff --numstat --no-lock-index 2>/dev/null | wc -l | tr -d ' ')
+  GIT_ST=""
+  [ "$STAGED" -gt 0 ] && GIT_ST="${GREEN}+${STAGED}${RESET}"
+  [ "$MODIFIED" -gt 0 ] && GIT_ST="${GIT_ST}${YELLOW}~${MODIFIED}${RESET}"
+  GIT_INFO=" | ${BRANCH}${GIT_ST:+ $GIT_ST}"
 fi
 
-# Format cost
-COST_STR=$(printf '$%.2f' "$COST")
+# Session name label
+SESSION_LABEL=""
+[ -n "$SESSION_NAME" ] && SESSION_LABEL=" ${MAGENTA}(${SESSION_NAME})${RESET}"
 
-echo -e "${CYAN}${MODEL}${RESET} ${DIR##*/}${GIT_INFO} | ${YELLOW}${COST_STR}${RESET} | ctx:${CTX_COLOR}[${CTX_BAR}]${RESET}${CTX}%${LIMITS}"
+# Vim mode indicator
+VIM_LABEL=""
+if [ -n "$VIM_MODE" ]; then
+  case "$VIM_MODE" in
+    INSERT)        VIM_LABEL=" ${GREEN}[I]${RESET}" ;;
+    NORMAL)        VIM_LABEL=" [N]" ;;
+    VISUAL)        VIM_LABEL=" ${YELLOW}[V]${RESET}" ;;
+    "VISUAL LINE") VIM_LABEL=" ${YELLOW}[VL]${RESET}" ;;
+    *)             VIM_LABEL=" [${VIM_MODE}]" ;;
+  esac
+fi
+
+# Effort indicator
+EFFORT_LABEL=""
+[ -n "$EFFORT" ] && EFFORT_LABEL=" effort:${EFFORT}"
+
+printf "${BOLD}${CYAN}%s${RESET}%s %s%s%s | ctx:%s[%s]${RESET}%s%%%s%s\n" \
+  "$MODEL" \
+  "$EFFORT_LABEL" \
+  "${DIR##*/}" \
+  "$GIT_INFO" \
+  "$SESSION_LABEL" \
+  "$CTX_COLOR" \
+  "$CTX_BAR" \
+  "$CTX" \
+  "$LIMITS" \
+  "$VIM_LABEL"
 SCRIPT
 chmod +x ~/.claude/statusline.sh
 echo "  statusline.sh created and made executable."
@@ -139,12 +219,10 @@ SETTINGS_FILE=~/.claude/settings.json
 
 if [ -f "$SETTINGS_FILE" ]; then
   if jq -e '.statusLine' "$SETTINGS_FILE" &>/dev/null; then
-    # Update existing statusLine config
     jq '.statusLine = {"type": "command", "command": "~/.claude/statusline.sh"}' "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp"
     mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
     echo "  statusLine updated in existing settings.json."
   else
-    # Add statusLine to existing settings
     jq '. + {"statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}}' "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp"
     mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
     echo "  statusLine added to existing settings.json."
@@ -166,8 +244,8 @@ echo "=== Setup complete! ==="
 echo "Restart Claude Code to see the status line."
 echo ""
 echo "Status line shows:"
-echo "  Model name (cyan) | Project folder | Git branch +staged ~modified"
-echo "  Session cost (yellow) | Context usage bar | 5-hour quota bar | 7-day quota bar"
+echo "  Model + effort | Project folder | Git branch +staged ~modified | Session"
+echo "  ctx:[bar]% | 5h:[bar]% rst:Xh Ym | 7d:[bar]% rst:Xd Yh | Vim mode"
 echo ""
 echo "Bar colors: green (<70%) | yellow (70-89%) | red (90%+)"
-echo "Quota bars only appear for Pro/Max subscribers."
+echo "Quota bars + reset countdowns only appear for Pro/Max subscribers."
