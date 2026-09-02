@@ -6,17 +6,34 @@ Custom statusline configurations for Claude Code CLI.
 
 ### `setup-statusline.sh` (Basic)
 
-A bash-based statusline showing, left to right:
+A bash-based **two-line HUD**. Line 1 is identity (stable, rarely changes); line 2 is
+the meters you actually watch:
 
-- **Model name** (bold cyan), e.g. `Claude Opus 4.7 (1M context)`
-- **Effort level** (when set), e.g. `effort:high`
-- **Project folder** — basename of the working directory
-- **Git branch + status** — `master +2 ~3` (green for staged, yellow for modified). Worktree-aware: uses the worktree branch from the harness JSON when available.
+```
+● Opus 5 1M · xhigh   claude-statusline   master ~2   (statusline-fix)   [I]
+  ctx ████░░░░░░ 43%    5h ███████░░░ 73% ↻ 2h35m    7d █▌░░░░░░░░ 18% ↻ 3d3h
+```
+
+**Line 1 — identity**
+
+- **Health dot** `●` — colored by the *worst* of context / 5h / 7d, so one glyph
+  summarizes pressure before you read any number.
+- **Model name** (bold cyan), shortened: `Claude Opus 5 (1M context)` → `Opus 5 1M`
+- **Effort level** (dim, when set), e.g. `· xhigh`
+- **Project folder** (bold) — basename of the working directory
+- **Git branch + status** — `master +2 ~3` (green staged, yellow modified). Worktree-aware:
+  uses the worktree branch from the harness JSON when available.
 - **Session name** — magenta `(my-session)` when set via `/rename`
-- **Context bar** — 10-char `[####------]` with color: green <70%, yellow 70-89%, red 90%+
-- **5-hour quota bar** + `rst:2h 36m` countdown until reset *(Pro/Max only)*
-- **7-day quota bar** + `rst:3d 4h` countdown until reset *(Pro/Max only)*
-- **Vim mode indicator** — `[I]` / `[N]` / `[V]` / `[VL]` when vim mode is active
+- **Vim mode** — `[I]` / `[N]` / `[V]` / `[VL]` when vim mode is active
+
+**Line 2 — meters**
+
+- **Context**, **5-hour quota**, **7-day quota** *(quotas are Pro/Max only)*
+- Bars are 10 Unicode cells (`█` `▌` `░`). The half-block gives 5% resolution instead
+  of the 10% an all-or-nothing block bar can show.
+- Bar color: green <70%, yellow 70-89%, red 90%+. The empty track and labels are dim
+  gray so color carries meaning rather than decoration.
+- `↻ 2h35m` — countdown until that quota resets. Auto-hides when unknown or past.
 
 **Usage:**
 ```bash
@@ -30,8 +47,12 @@ The script installs `jq` if missing, writes `~/.claude/statusline.sh`, and wires
 
 - ANSI color variables use bash ANSI-C quoting (`$'\033[..m'`) so they hold real ESC bytes and render correctly when interpolated into `printf %s` arguments.
 - Reset countdowns are computed from `rate_limits.five_hour.resets_at` and `rate_limits.seven_day.resets_at` (Unix epoch seconds in the harness input). They auto-hide when the field is absent or already in the past.
-- Git commands use `--no-lock-index` to avoid contending with concurrent Claude Code operations.
+- Git commands use the global `--no-optional-locks` flag, which must appear **before** the subcommand (`git --no-optional-locks -C dir diff …`). There is no `--no-lock-index` option; passing it makes every git call exit 129, silently blanking the branch and status.
+- Bars floor to the nearest 5%, so a bar never overstates usage.
 - Context percentage is rounded to an integer and defaults to 0 before the first API response.
+- On Windows, `winget` only updates `PATH` for *new* shells, so the installer probes the
+  WinGet/choco install directories and adds `jq` to `PATH` for the current run, then verifies
+  `jq` is callable before touching `settings.json`.
 
 ### claude-hud (Recommended)
 
